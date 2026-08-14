@@ -2,11 +2,11 @@
 
 > Multi-stage, high-performance reconnaissance and attack surface mapping pipeline.
 
-`ReconAutomator` automates passive and active external asset discovery, DNS resolution, HTTP probing, technology stack detection, port scanning, and web endpoint crawling with built-in rate-limiting and structured reporting.
+`ReconAutomator` automates passive and active external asset discovery, DNS resolution, HTTP probing, technology stack detection, port scanning, web endpoint crawling, and deep JavaScript secret/route extraction with built-in rate-limiting and structured reporting.
 
 ---
 
-## 🚀 Features
+## 🚀 Pipeline Stages
 
 - **Stage 1: Passive Subdomain Enumeration**
   - Queries Certificate Transparency logs (`crt.sh`)
@@ -18,14 +18,16 @@
 - **Stage 3: HTTP Probing & Technology Fingerprinting**
   - Probes live services on common web ports (`httpx`)
   - Extracts HTTP status codes, page titles, server banners, CDN/WAF detection, and tech stacks
-- **Stage 4: Port & Service Scanning (Optional)**
-  - Fast port enumeration on discovered target IPs using `naabu`
-- **Stage 5: Web Crawling & Endpoint Discovery (Optional)**
-  - Deep URL and JavaScript spidering using `katana`
-- **Rate-Limiting & Anti-Throttle Protection**
-  - Configurable requests-per-second (`--rate-limit`) and crawler delays (`--delay`) across all tools
-- **Structured Markdown Reporting**
-  - Automatically compiles an executive `SUMMARY.md` report with markdown tables for all discovered live assets
+- **Stage 4: Port & Service Scanning (`naabu`)**
+  - Fast port enumeration on discovered target hosts/IPs using `naabu` with TCP Connect (`-s c`) mode for non-root reliability and CDN avoidance (`-ec`)
+- **Stage 5: Web Crawling & Endpoint Discovery (`katana`)**
+  - Deep URL and JavaScript spidering using `katana` with headless and JavaScript parsing
+- **Stage 6: JavaScript Analysis, API Route Extraction & Secret Mining**
+  - Filters all `.js` asset files from crawls and live hosts
+  - Extracts internal API routes (`/api/`, `/v1/`, `/graphql`, etc.)
+  - Searches for hardcoded tokens (AWS keys, Google API keys, JWTs, Slack tokens, Stripe keys, Bearer headers)
+- **Stage 7: Structured Executive Reporting**
+  - Automatically compiles an executive `SUMMARY.md` report with markdown tables for all discovered live assets, open ports, and potential secrets
 
 ---
 
@@ -36,13 +38,13 @@ The following tools should be installed and available in your `$PATH`:
 - `subfinder`
 - `dnsx`
 - `httpx`
-- `naabu` (optional, for `--full` port scan)
-- `katana` (optional, for `--full` spidering)
-- `jq`, `curl`
+- `naabu`
+- `katana`
+- `jq`, `curl`, `python3`
 
 ### Quick Install on Kali / Debian
 ```bash
-sudo apt update && sudo apt install -y jq curl
+sudo apt update && sudo apt install -y jq curl python3
 
 # Install ProjectDiscovery tools (Go required)
 go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -82,25 +84,34 @@ sudo ln -sf "$(pwd)/recon.sh" /usr/local/bin/recon-automator
 | `-t` | `--threads` | Concurrency / Worker threads | `25` |
 | `-r` | `--rate-limit` | Max requests per second across tools | `100` |
 | | `--delay` | Delay in seconds between crawler requests | `0` |
+| | `--ports` | Custom port list for naabu (`100`, `1000`, `80,443,8080`) | `top-100` |
+| | `--skip-ports` | Skip port scanning stage | `false` |
+| | `--skip-crawl` | Skip web crawling stage | `false` |
+| | `--skip-js` | Skip JavaScript analysis stage | `false` |
 | `-p` | `--passive` | Run passive enumeration only (no active probing) | `false` |
-| `-f` | `--full` | Full run (includes port scan and web crawling) | `false` |
+| `-f` | `--full` | Full run (top-1000 ports + deep crawl) | `false` |
 | `-h` | `--help` | Display help message and exit | - |
 
 ---
 
 ## 💡 Examples
 
-### 1. Standard Recon (Subdomains + DNS + HTTP Tech Detection)
+### 1. Standard Recon (Subdomains + DNS + HTTP + Ports + Katana + JS Filter)
 ```bash
 ./recon.sh -d example.com -r 50 -t 20
 ```
 
-### 2. Passive-Only Enumeration (Zero Packets Sent to Target)
+### 2. Custom Ports Scan
+```bash
+./recon.sh -d example.com --ports 80,443,8080,8443,8000,8888,3000,5000
+```
+
+### 3. Passive-Only Enumeration (Zero Packets Sent to Target)
 ```bash
 ./recon.sh -d example.com --passive
 ```
 
-### 3. Full Deep Scan (With Port Scan & Katana Spidering)
+### 4. Full Deep Scan (Top-1000 Ports + Delay)
 ```bash
 ./recon.sh -d example.com --full -r 30 --delay 1 -o ./targets
 ```
@@ -114,23 +125,27 @@ All artifacts and reports are saved in `recon_results/<domain>/`:
 ```text
 recon_results/example.com/
 ├── subdomains/
-│   ├── raw_subs.txt
-│   └── unique_subdomains.txt
+│   ├── raw_subs.txt                # Raw harvested subdomains
+│   └── unique_subdomains.txt       # Clean, deduplicated subdomains
 ├── dns/
-│   ├── resolved_subdomains.txt
-│   ├── unique_ips.txt
-│   └── dns_records.json
+│   ├── resolved_subdomains.txt     # Verified live DNS hosts
+│   ├── unique_ips.txt              # Resolved IP addresses
+│   └── dns_records.json            # Full DNS record JSON
 ├── web/
-│   ├── alive_urls.txt
-│   ├── httpx_summary.txt
-│   └── httpx_detailed.json
-├── ports/                          # (Generated when using --full)
-│   └── open_ports.txt
-├── endpoints/                      # (Generated when using --full)
-│   └── endpoints.txt
+│   ├── alive_urls.txt              # Responsive HTTP/HTTPS URLs
+│   ├── httpx_summary.txt           # Formatted tabular overview
+│   └── httpx_detailed.json         # Raw JSON with headers & tech stack
+├── ports/
+│   └── open_ports.txt              # Open ports detected by naabu
+├── endpoints/
+│   └── endpoints.txt               # Crawled routes & URL parameters
+├── js/
+│   ├── js_urls.txt                 # Extracted JavaScript asset URLs
+│   ├── js_endpoints.txt            # Internal API routes extracted from JS
+│   └── js_secrets.txt              # Potential keys/secrets found in JS
 ├── reports/
-│   └── SUMMARY.md                  # Executive Markdown Summary
-└── recon.log
+│   └── SUMMARY.md                  # Executive Markdown Summary Report
+└── recon.log                       # Full execution log
 ```
 
 ---
