@@ -1,0 +1,18 @@
+# Scan Results & Output
+recon_results/
+targets/
+*.log
+raw_subs.txt
+unique_subdomains.txt
+resolved_subdomains.txt
+alive_urls.txt
+dns_records.json
+httpx_detailed.json
+open_ports.txt
+endpoints.txt
+
+# OS & Temp Files
+.DS_Store
+*.tmp
+*.swp
+*~
