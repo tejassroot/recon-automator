@@ -4,11 +4,11 @@
 # ==============================================================================
 # Pipeline Stages:
 #   1. Subdomain Discovery (Passive: crt.sh, subfinder)
-#   2. DNS Resolution & Live Asset Filtering (dnsx)
+#   2. DNS Resolution & Live Asset Filtering (dnsx with wildcard filtering)
 #   3. HTTP Probing, Tech Fingerprinting & Web Titles (httpx)
-#   4. Port Scanning & Service Identification (naabu)
-#   5. Web Crawling & Endpoint Discovery (katana)
-#   6. JavaScript Asset Filtering, API Extraction & Secret Mining
+#   4. Port Scanning & Service Identification (naabu with CDN exclusion)
+#   5. Web Crawling & Endpoint Discovery (katana with scope controls)
+#   6. JavaScript Asset Filtering, API Extraction & Secret Mining (Entropy-filtered)
 # ==============================================================================
 
 set -eo pipefail
@@ -105,6 +105,9 @@ if [[ -z "${DOMAIN:-}" ]]; then
     usage 1
 fi
 
+# Clean up domain input (strip protocol, trailing slash, www prefix if any)
+DOMAIN=$(echo "${DOMAIN}" | sed -e 's|^https\?://||' -e 's|/.*$||' | tr '[:upper:]' '[:lower:]')
+
 # Directory Structure Setup
 TARGET_DIR="${OUTPUT_BASE}/${DOMAIN}"
 mkdir -p "${TARGET_DIR}/subdomains" \
@@ -150,8 +153,8 @@ SUB_OUTPUT="${TARGET_DIR}/subdomains/raw_subs.txt"
 # 1.1: crt.sh Certificate Transparency
 log_info "Querying crt.sh Certificate Transparency logs..."
 curl -s --max-time 30 --retry 2 "https://crt.sh/?q=%25.${DOMAIN}&output=json" 2>/dev/null | \
-    jq -r '.[].name_value' 2>/dev/null | \
-    sed 's/\*\.//g' | tr '[:upper:]' '[:lower:]' | sort -u >> "${SUB_OUTPUT}" || true
+    jq -r '.[].name_value // empty' 2>/dev/null | \
+    tr '\r' '\n' | sed -e 's/\*\.//g' -e 's/^[ \t]*//' | tr '[:upper:]' '[:lower:]' >> "${SUB_OUTPUT}" || true
 
 # 1.2: Subfinder (with rate-limiting)
 if check_tool subfinder; then
@@ -162,18 +165,17 @@ if check_tool subfinder; then
               -rate-limit "${RATE_LIMIT}" >> "${SUB_OUTPUT}" || true
 fi
 
-# 1.3: Deduplicate
+# 1.3: Deduplicate with strict regex anchoring & domain escaping
 CLEAN_SUBS="${TARGET_DIR}/subdomains/unique_subdomains.txt"
-grep -E "([a-zA-Z0-9_-]+\.)+${DOMAIN}$" "${SUB_OUTPUT}" 2>/dev/null | sort -u > "${CLEAN_SUBS}" || true
+ESCAPED_DOMAIN=$(printf '%s\n' "${DOMAIN}" | sed 's/[^^]/[&]/g; s/\^/\\^/g')
+grep -Ei "^([a-zA-Z0-9_-]+\.)*${ESCAPED_DOMAIN}$" "${SUB_OUTPUT}" 2>/dev/null | tr '[:upper:]' '[:lower:]' | sort -u > "${CLEAN_SUBS}" || true
 
-SUB_COUNT=$(wc -l < "${CLEAN_SUBS:-/dev/null}" || echo "0")
+# Ensure apex domain is included
+echo "${DOMAIN}" >> "${CLEAN_SUBS}"
+sort -u -o "${CLEAN_SUBS}" "${CLEAN_SUBS}"
+
+SUB_COUNT=$(wc -l < "${CLEAN_SUBS}" || echo "0")
 log_success "Discovered ${BOLD}${SUB_COUNT}${NC} unique subdomains for ${DOMAIN}."
-
-if [[ "${SUB_COUNT}" -eq 0 ]]; then
-    log_warn "No subdomains found. Adding apex domain (${DOMAIN}) to list."
-    echo "${DOMAIN}" > "${CLEAN_SUBS}"
-    SUB_COUNT=1
-fi
 
 if [[ "${PASSIVE_ONLY}" -eq 1 ]]; then
     log_success "Passive recon completed. Results stored in: ${TARGET_DIR}"
@@ -181,7 +183,7 @@ if [[ "${PASSIVE_ONLY}" -eq 1 ]]; then
 fi
 
 # ==============================================================================
-# STAGE 2: DNS Resolution & Active Asset Filtering
+# STAGE 2: DNS Resolution & Active Asset Filtering (Wildcard Aware)
 # ==============================================================================
 log_stage "2" "DNS Resolution & Host Verification"
 
@@ -189,12 +191,16 @@ RESOLVED_SUBS="${TARGET_DIR}/dns/resolved_subdomains.txt"
 RESOLVED_JSON="${TARGET_DIR}/dns/dns_records.json"
 IPS_FILE="${TARGET_DIR}/dns/unique_ips.txt"
 
+> "${RESOLVED_SUBS}"
+> "${IPS_FILE}"
+
 if check_tool dnsx; then
-    log_info "Resolving subdomains using dnsx (rate limit: ${RATE_LIMIT} rps)..."
+    log_info "Resolving subdomains using dnsx (with wildcard detection, rate limit: ${RATE_LIMIT} rps)..."
     dnsx -l "${CLEAN_SUBS}" \
          -silent \
          -t "${THREADS}" \
          -rate-limit "${RATE_LIMIT}" \
+         -wd "${DOMAIN}" \
          -a -cname -resp \
          -json -o "${RESOLVED_JSON}" || true
 
@@ -202,15 +208,13 @@ if check_tool dnsx; then
         jq -r '.host' "${RESOLVED_JSON}" 2>/dev/null | sort -u > "${RESOLVED_SUBS}" || true
         jq -r '.a[]? // empty' "${RESOLVED_JSON}" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u > "${IPS_FILE}" || true
     fi
-fi
-
-if [[ ! -s "${RESOLVED_SUBS}" ]]; then
-    log_warn "dnsx yielded no hosts, falling back to raw subdomain list."
+else
+    log_warn "dnsx not installed. Falling back to unique subdomains without active DNS filtering."
     cp "${CLEAN_SUBS}" "${RESOLVED_SUBS}"
 fi
 
-ALIVE_COUNT=$(wc -l < "${RESOLVED_SUBS:-/dev/null}" || echo "0")
-IP_COUNT=$(wc -l < "${IPS_FILE:-/dev/null}" || echo "0")
+ALIVE_COUNT=$(wc -l < "${RESOLVED_SUBS}" || echo "0")
+IP_COUNT=$(wc -l < "${IPS_FILE}" || echo "0")
 log_success "Resolved ${BOLD}${ALIVE_COUNT}${NC} live subdomains (${IP_COUNT} unique IPs)."
 
 # ==============================================================================
@@ -222,7 +226,9 @@ HTTPX_OUTPUT="${TARGET_DIR}/web/httpx_summary.txt"
 HTTPX_JSON="${TARGET_DIR}/web/httpx_detailed.json"
 WEB_URLS="${TARGET_DIR}/web/alive_urls.txt"
 
-if check_tool httpx; then
+> "${WEB_URLS}"
+
+if [[ -s "${RESOLVED_SUBS}" ]] && check_tool httpx; then
     log_info "Probing web services with httpx (rate limit: ${RATE_LIMIT} rps)..."
     httpx -l "${RESOLVED_SUBS}" \
           -silent \
@@ -237,7 +243,8 @@ if check_tool httpx; then
           -json -o "${HTTPX_JSON}" || true
 
     if [[ -f "${HTTPX_JSON}" ]]; then
-        jq -r '.url' "${HTTPX_JSON}" 2>/dev/null | sort -u > "${WEB_URLS}" || true
+        # Filter URLs to retain in-scope target domains (suppress third-party redirect targets)
+        jq -r --arg dom "${DOMAIN}" 'select(.url | test("^[a-z]+://([a-zA-Z0-9_-]+\\.)*" + ($dom|gsub("\\."; "\\.")) + "(/|:|$)"; "i")) | .url' "${HTTPX_JSON}" 2>/dev/null | sort -u > "${WEB_URLS}" || true
         
         # Formatted readable summary table
         jq -r '[.url, (.status_code|tostring), (.title // "-"), (.tech // [] | join(","))] | @tsv' "${HTTPX_JSON}" 2>/dev/null | \
@@ -245,11 +252,11 @@ if check_tool httpx; then
     fi
 fi
 
-WEB_COUNT=$(wc -l < "${WEB_URLS:-/dev/null}" || echo "0")
-log_success "Found ${BOLD}${WEB_COUNT}${NC} responsive web endpoints."
+WEB_COUNT=$(wc -l < "${WEB_URLS}" || echo "0")
+log_success "Found ${BOLD}${WEB_COUNT}${NC} responsive in-scope web endpoints."
 
 # ==============================================================================
-# STAGE 4: Port & Service Discovery (Naabu)
+# STAGE 4: Port & Service Discovery (Naabu - CDN Excluded)
 # ==============================================================================
 OPEN_PORTS="${TARGET_DIR}/ports/open_ports.txt"
 > "${OPEN_PORTS}"
@@ -264,9 +271,9 @@ if [[ "${SKIP_PORTS}" -eq 0 ]] && check_tool naabu; then
     fi
 
     if [[ -s "${PORT_TARGETS}" ]]; then
-        log_info "Scanning ports (${PORT_LIST}) with naabu (TCP connect mode, rate: ${RATE_LIMIT} pps)..."
+        log_info "Scanning ports (${PORT_LIST}) with naabu (excluding CDN edge nodes, TCP connect mode, rate: ${RATE_LIMIT} pps)..."
         
-        NAABU_ARGS=("-l" "${PORT_TARGETS}" "-rate" "${RATE_LIMIT}" "-scan-type" "c" "-ec" "-silent" "-o" "${OPEN_PORTS}")
+        NAABU_ARGS=("-l" "${PORT_TARGETS}" "-exclude-cdn" "-rate" "${RATE_LIMIT}" "-scan-type" "c" "-ec" "-silent" "-o" "${OPEN_PORTS}")
         
         if [[ "${PORT_LIST}" == "top-100" || "${PORT_LIST}" == "100" ]]; then
             NAABU_ARGS+=("-top-ports" "100")
@@ -280,15 +287,15 @@ if [[ "${SKIP_PORTS}" -eq 0 ]] && check_tool naabu; then
 
         naabu "${NAABU_ARGS[@]}" || true
         
-        PORT_COUNT=$(wc -l < "${OPEN_PORTS:-/dev/null}" || echo "0")
-        log_success "Discovered ${BOLD}${PORT_COUNT}${NC} open ports/services."
+        PORT_COUNT=$(wc -l < "${OPEN_PORTS}" || echo "0")
+        log_success "Discovered ${BOLD}${PORT_COUNT}${NC} open ports/services on origin assets."
     else
         log_warn "No hosts available for port scanning."
     fi
 fi
 
 # ==============================================================================
-# STAGE 5: Web Crawling & Endpoint Discovery (Katana)
+# STAGE 5: Web Crawling & Endpoint Discovery (Katana - Scope Restricted)
 # ==============================================================================
 ENDPOINTS_FILE="${TARGET_DIR}/endpoints/endpoints.txt"
 > "${ENDPOINTS_FILE}"
@@ -296,16 +303,28 @@ ENDPOINTS_FILE="${TARGET_DIR}/endpoints/endpoints.txt"
 if [[ "${SKIP_CRAWL}" -eq 0 ]] && [[ -s "${WEB_URLS}" ]] && check_tool katana; then
     log_stage "5" "Web Crawling & Endpoint Discovery (Katana)"
     
-    log_info "Crawling web assets with katana (depth: 2, concurrency: ${THREADS}, rate limit: ${RATE_LIMIT})..."
+    log_info "Crawling web assets with katana (depth: 2, strictly in-scope, concurrency: ${THREADS}, rate limit: ${RATE_LIMIT})..."
     
-    KATANA_ARGS=("-list" "${WEB_URLS}" "-depth" "2" "-jc" "-kf" "all" "-crawl-duration" "2m" "-silent" "-concurrency" "${THREADS}" "-rate-limit" "${RATE_LIMIT}" "-o" "${ENDPOINTS_FILE}")
+    KATANA_ARGS=(
+        "-list" "${WEB_URLS}"
+        "-depth" "2"
+        "-jc"
+        "-kf" "all"
+        "-crawl-duration" "2m"
+        "-crawl-scope" "([a-zA-Z0-9_-]+\\.)*${DOMAIN}"
+        "-extension-filter" "png,jpg,jpeg,gif,svg,ico,css,woff,woff2,ttf,eot,mp4,avi,pdf,docx"
+        "-silent"
+        "-concurrency" "${THREADS}"
+        "-rate-limit" "${RATE_LIMIT}"
+        "-o" "${ENDPOINTS_FILE}"
+    )
     if [[ "${DELAY}" -gt 0 ]]; then
         KATANA_ARGS+=("-delay" "${DELAY}")
     fi
     
     katana "${KATANA_ARGS[@]}" || true
     
-    EP_COUNT=$(wc -l < "${ENDPOINTS_FILE:-/dev/null}" || echo "0")
+    EP_COUNT=$(wc -l < "${ENDPOINTS_FILE}" || echo "0")
     log_success "Discovered ${BOLD}${EP_COUNT}${NC} endpoints & web assets."
 fi
 
@@ -325,27 +344,27 @@ if [[ "${SKIP_JS}" -eq 0 ]]; then
 
     log_info "Extracting and deduplicating JavaScript URLs..."
     
-    # 6.1: Filter JS files from endpoints and live URLs
+    # 6.1: Filter JS files from endpoints and live URLs (strictly in-scope)
     if [[ -s "${ENDPOINTS_FILE}" ]]; then
-        grep -iE '\.js(\?|$)' "${ENDPOINTS_FILE}" | grep -E '^https?://' | sort -u >> "${JS_URLS_FILE}" || true
+        grep -iE '\.js(\?|$)' "${ENDPOINTS_FILE}" | grep -Ei "^https?://([a-zA-Z0-9_-]+\.)*${ESCAPED_DOMAIN}" | sort -u >> "${JS_URLS_FILE}" || true
     fi
     
     if [[ -s "${WEB_URLS}" ]]; then
-        # Append direct JS files if any exist in alive_urls
-        grep -iE '\.js(\?|$)' "${WEB_URLS}" | sort -u >> "${JS_URLS_FILE}" || true
+        grep -iE '\.js(\?|$)' "${WEB_URLS}" | grep -Ei "^https?://([a-zA-Z0-9_-]+\.)*${ESCAPED_DOMAIN}" | sort -u >> "${JS_URLS_FILE}" || true
     fi
 
     sort -u -o "${JS_URLS_FILE}" "${JS_URLS_FILE}" 2>/dev/null || true
-    JS_COUNT=$(wc -l < "${JS_URLS_FILE:-/dev/null}" || echo "0")
-    log_success "Identified ${BOLD}${JS_COUNT}${NC} unique JavaScript URLs."
+    JS_COUNT=$(wc -l < "${JS_URLS_FILE}" || echo "0")
+    log_success "Identified ${BOLD}${JS_COUNT}${NC} unique in-scope JavaScript URLs."
 
-    # 6.2: Python-based JS Inspector (Endpoints & Secret Patterns)
+    # 6.2: Python-based JS Inspector (Endpoints & High-Fidelity Secret Patterns)
     if [[ "${JS_COUNT}" -gt 0 ]]; then
-        log_info "Analyzing JavaScript files for API routes, endpoints, and sensitive credentials..."
+        log_info "Analyzing JavaScript files with entropy checks and false-positive suppression..."
         
         python3 - "${JS_URLS_FILE}" "${JS_ENDPOINTS_FILE}" "${JS_SECRETS_FILE}" "${THREADS}" "${RATE_LIMIT}" << 'PYEOF'
 import sys
 import re
+import math
 import urllib.request
 import ssl
 from concurrent.futures import ThreadPoolExecutor
@@ -357,48 +376,92 @@ ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
+# 1. Ignore 3rd-party vendor and analytics libraries (massive source of false positives)
+VENDOR_BLACKLIST = re.compile(
+    r'(jquery|bootstrap|react|vue|angular|gtm|analytics|sentry|recaptcha|polyfill|moment|lodash|clarity|intercom|segment|newrelic|tinymce|ckeditor|mathjax|core-js)\b',
+    re.I
+)
+
+# 2. Known false-positive strings / placeholder keywords
+FP_KEYWORDS = {
+    "example", "sample", "dummy", "placeholder", "undefined", "null", 
+    "your_key", "your_secret", "changeme", "default", "xxxx", "test",
+    "true", "false", "bearer", "authorization", "none", "secret_key"
+}
+
+def shannon_entropy(data: str) -> float:
+    """Calculate Shannon entropy to ensure value is random enough to be a real secret."""
+    if not data:
+        return 0.0
+    entropy = 0
+    for x in set(data):
+        p_x = float(data.count(x)) / len(data)
+        entropy += - p_x * math.log2(p_x)
+    return entropy
+
+def is_valid_secret(val: str, min_entropy: float = 3.2) -> bool:
+    v_clean = val.strip().strip("'\"").lower()
+    if len(v_clean) < 12:
+        return False
+    if any(fp in v_clean for fp in FP_KEYWORDS):
+        return False
+    if re.match(r'^(.)\1+$', v_clean): # e.g. 00000000000000
+        return False
+    return shannon_entropy(val) >= min_entropy
+
+SECRET_PATTERNS = [
+    ("AWS Access Key", re.compile(r'\bAKIA[0-9A-Z]{16}\b')),
+    ("Slack Webhook", re.compile(r'https://hooks\.slack\.com/services/T[0-9A-Z]{8,12}/B[0-9A-Z]{8,12}/[0-9a-zA-Z]{24}')),
+    ("Slack Bot Token", re.compile(r'\bxox[baprs]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*\b')),
+    ("Stripe Secret Key", re.compile(r'\bsk_live_[0-9a-zA-Z]{24,}\b')),
+    ("GitHub Personal Access Token", re.compile(r'\bgh[pousr]_[0-9a-zA-Z]{36}\b')),
+    ("Private RSA/DSA/EC Key", re.compile(r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----')),
+    ("High-Entropy Secret Variable", re.compile(r'["\'](?:api_?secret|client_?secret|jwt_?secret|auth_?token)["\']\s*[:=]\s*["\']([a-zA-Z0-9_\-\.]{20,})["\']', re.I))
+]
+
+# Refined Endpoint Pattern: Discard CSS/fonts/images/source-maps
+EP_PATTERN = re.compile(r'["\'](/(?:api|v[0-9]|rest|graphql)/[a-zA-Z0-9_\-\./\?=&%]+)["\']', re.I)
+STATIC_EXTS = re.compile(r'\.(png|jpg|jpeg|gif|svg|ico|css|woff|woff2|ttf|eot|map)$', re.I)
+
 with open(js_urls_file, "r", encoding="utf-8", errors="ignore") as f:
-    urls = [line.strip() for line in f if line.strip().startswith("http")]
+    urls = [
+        line.strip() for line in f 
+        if line.strip().startswith("http") and not VENDOR_BLACKLIST.search(line)
+    ]
 
 endpoints_found = set()
 secrets_found = set()
 
-# Regex Patterns
-EP_PATTERN = re.compile(r'["\'](/api/[a-zA-Z0-9_\-\./\?=&%#]+|/v[0-9]/[a-zA-Z0-9_\-\./\?=&%#]+|/graphql[a-zA-Z0-9_\-\./\?=&%#]*|/rest/[a-zA-Z0-9_\-\./\?=&%#]+)["\']')
-GENERIC_ROUTE = re.compile(r'["\'](/[a-zA-Z0-9_-]+/[a-zA-Z0-9_\-\./\?=&%#]+)["\']')
-
-SECRET_PATTERNS = [
-    ("AWS Access Key", re.compile(r'AKIA[0-9A-Z]{16}')),
-    ("Google API Key", re.compile(r'AIza[0-9A-Za-z\-_]{35}')),
-    ("JWT Token", re.compile(r'eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}')),
-    ("Slack Token/Webhook", re.compile(r'xox[baprs]-[0-9a-zA-Z]{10,48}|https://hooks\.slack\.com/services/T[0-9A-Z]+/B[0-9A-Z]+/[0-9a-zA-Z]+')),
-    ("Stripe Key", re.compile(r'sk_live_[0-9a-zA-Z]{24}')),
-    ("GitHub Token", re.compile(r'gh[pousr]_[0-9a-zA-Z]{36}')),
-    ("Bearer Header", re.compile(r'["\']Bearer\s+([a-zA-Z0-9_\-\.]{20,})["\']', re.I)),
-    ("Hardcoded Password/Secret", re.compile(r'["\']?(?:secret|api_?key|auth_?token|client_?secret)["\']?\s*[:=]\s*["\']([a-zA-Z0-9_\-\.]{12,})["\']', re.I))
-]
-
 def scan_url(url):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-            content = resp.read().decode("utf-8", errors="ignore")
+        req = urllib.request.Request(
+            url, 
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if "javascript" not in content_type and "text" not in content_type and "json" not in content_type:
+                return
+            content = resp.read(2 * 1024 * 1024).decode("utf-8", errors="ignore") # Max 2MB per file
             
-            # Extract Endpoints
+            # 1. Extract API Endpoints
             for match in EP_PATTERN.findall(content):
-                endpoints_found.add(f"{match} (from {url})")
+                if not STATIC_EXTS.search(match.split("?")[0]):
+                    endpoints_found.add(f"{match} (from {url})")
             
-            # Extract Secrets
+            # 2. Extract Sensitive Credentials
             for name, pat in SECRET_PATTERNS:
-                for s in pat.findall(content):
-                    if isinstance(s, tuple):
-                        s = s[0]
-                    secrets_found.add(f"[{name}] {s} (in {url})")
+                for match in pat.findall(content):
+                    candidate = match[0] if isinstance(match, tuple) else match
+                    if name == "High-Entropy Secret Variable":
+                        if not is_valid_secret(candidate, min_entropy=3.4):
+                            continue
+                    secrets_found.add(f"[{name}] {candidate} (in {url})")
     except Exception:
         pass
 
 with ThreadPoolExecutor(max_workers=threads) as executor:
-    executor.map(scan_url, urls[:300]) # Cap at first 300 JS files for speed & rate limits
+    executor.map(scan_url, urls[:300])
 
 with open(ep_out_file, "w", encoding="utf-8") as f:
     for ep in sorted(endpoints_found):
@@ -409,9 +472,9 @@ with open(sec_out_file, "w", encoding="utf-8") as f:
         f.write(sec + "\n")
 PYEOF
         
-        EXT_EP_COUNT=$(wc -l < "${JS_ENDPOINTS_FILE:-/dev/null}" || echo "0")
-        EXT_SEC_COUNT=$(wc -l < "${JS_SECRETS_FILE:-/dev/null}" || echo "0")
-        log_success "Extracted ${BOLD}${EXT_EP_COUNT}${NC} API endpoints & ${BOLD}${EXT_SEC_COUNT}${NC} potential secrets from JS files."
+        EXT_EP_COUNT=$(wc -l < "${JS_ENDPOINTS_FILE}" || echo "0")
+        EXT_SEC_COUNT=$(wc -l < "${JS_SECRETS_FILE}" || echo "0")
+        log_success "Extracted ${BOLD}${EXT_EP_COUNT}${NC} API endpoints & ${BOLD}${EXT_SEC_COUNT}${NC} validated secrets from proprietary JS."
     fi
 fi
 
@@ -429,10 +492,10 @@ REPORT_FILE="${TARGET_DIR}/reports/SUMMARY.md"
     echo "- **Resolved Hosts:** ${ALIVE_COUNT}"
     echo "- **Unique IP Addresses:** ${IP_COUNT}"
     echo "- **Active Web Services:** ${WEB_COUNT}"
-    echo "- **Open Ports/Services:** $(wc -l < "${OPEN_PORTS:-/dev/null}" || echo "0")"
-    echo "- **Crawled Endpoints:** $(wc -l < "${ENDPOINTS_FILE:-/dev/null}" || echo "0")"
-    echo "- **JavaScript Files:** $(wc -l < "${JS_URLS_FILE:-/dev/null}" || echo "0")"
-    echo "- **Extracted JS Routes:** $(wc -l < "${JS_ENDPOINTS_FILE:-/dev/null}" || echo "0")"
+    echo "- **Open Ports/Services:** $(wc -l < "${OPEN_PORTS}" || echo "0")"
+    echo "- **Crawled Endpoints:** $(wc -l < "${ENDPOINTS_FILE}" || echo "0")"
+    echo "- **In-Scope JavaScript Files:** $(wc -l < "${JS_URLS_FILE}" || echo "0")"
+    echo "- **Extracted JS Routes:** $(wc -l < "${JS_ENDPOINTS_FILE}" || echo "0")"
     echo ""
     echo "---"
     echo ""
@@ -447,7 +510,7 @@ REPORT_FILE="${TARGET_DIR}/reports/SUMMARY.md"
     if [[ -s "${OPEN_PORTS}" ]]; then
         echo "---"
         echo ""
-        echo "## 🔌 Discovered Open Ports"
+        echo "## 🔌 Discovered Open Ports (Origin Hosts)"
         echo "\`\`\`text"
         cat "${OPEN_PORTS}"
         echo "\`\`\`"
@@ -456,7 +519,7 @@ REPORT_FILE="${TARGET_DIR}/reports/SUMMARY.md"
     if [[ -s "${JS_SECRETS_FILE}" ]]; then
         echo "---"
         echo ""
-        echo "## 🔑 Potential Leaked Secrets in JS"
+        echo "## 🔑 Validated Secrets in JS"
         echo "\`\`\`text"
         head -n 25 "${JS_SECRETS_FILE}"
         echo "\`\`\`"
