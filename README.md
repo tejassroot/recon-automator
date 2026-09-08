@@ -89,7 +89,7 @@ sudo ln -sf "$(pwd)/recon.sh" /usr/local/bin/recon-automator
 | | `--skip-crawl` | Skip web crawling stage | `false` |
 | | `--skip-js` | Skip JavaScript analysis stage | `false` |
 | `-p` | `--passive` | Run passive enumeration only (no active probing) | `false` |
-| `-f` | `--full` | Full run (top-1000 ports + deep crawl) | `false` |
+| `-f` | `--full` | Full run (all ports + deep crawl) | `false` |
 | `-h` | `--help` | Display help message and exit | - |
 
 ---
@@ -111,7 +111,7 @@ sudo ln -sf "$(pwd)/recon.sh" /usr/local/bin/recon-automator
 ./recon.sh -d example.com --passive
 ```
 
-### 4. Full Deep Scan (Top-1000 Ports + Delay)
+### 4. Full Deep Scan (All Ports + Delay)
 ```bash
 ./recon.sh -d example.com --full -r 30 --delay 1 -o ./targets
 ```
@@ -142,7 +142,8 @@ recon_results/example.com/
 ├── js/
 │   ├── js_urls.txt                 # Extracted JavaScript asset URLs
 │   ├── js_endpoints.txt            # Internal API routes extracted from JS
-│   └── js_secrets.txt              # Potential keys/secrets found in JS
+│   ├── js_secrets.txt              # Potential keys/secrets found in JS
+│   └── js_secrets_redacted.txt     # Safe masked secrets for reporting
 ├── reports/
 │   └── SUMMARY.md                  # Executive Markdown Summary Report
 └── recon.log                       # Full execution log

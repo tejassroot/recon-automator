@@ -4,7 +4,7 @@
 # ==============================================================================
 # Pipeline Stages:
 #   1. Subdomain Discovery (Passive: crt.sh, subfinder)
-#   2. DNS Resolution & Live Asset Filtering (dnsx with wildcard filtering)
+#   2. DNS Resolution & Live Asset Filtering (dnsx with auto wildcard filtering)
 #   3. HTTP Probing, Tech Fingerprinting & Web Titles (httpx)
 #   4. Port Scanning & Service Identification (naabu with CDN exclusion)
 #   5. Web Crawling & Endpoint Discovery (katana with scope controls)
@@ -12,6 +12,14 @@
 # ==============================================================================
 
 set -eo pipefail
+
+# Signal trap for clean termination of pipeline and subprocesses
+cleanup_exit() {
+    echo -e "\n\033[0;31m[!] Execution interrupted by user. Cleaning up...\033[0m"
+    kill 0 2>/dev/null || true
+    exit 130
+}
+trap cleanup_exit SIGINT SIGTERM
 
 # Color Codes
 RED='\033[0;31m'
@@ -33,6 +41,7 @@ SKIP_CRAWL=0
 SKIP_JS=0
 FULL_SCAN=0
 PORT_LIST="top-100"
+PORTS_USER_SPECIFIED=0
 OUTPUT_BASE="./recon_results"
 
 banner() {
@@ -60,12 +69,12 @@ usage() {
     echo "  -o, --output <dir>           Base output directory (default: ./recon_results)"
     echo "  -t, --threads <num>          Concurrency / Worker threads (default: 25)"
     echo "  -r, --rate-limit <rps>       Max requests per second rate limit (default: 100)"
-    echo "      --delay <sec>            Delay in seconds between crawler requests (default: 0)"
+    echo "      --delay <sec>            Delay in seconds between crawler/analyzer requests (default: 0)"
     echo ""
     echo -e "${BOLD}Scan Scope Options:${NC}"
     echo "  -p, --passive                Passive enumeration only (crt.sh, subfinder)"
     echo "  -f, --full                   Full aggressive scan (all ports + deep crawl)"
-    echo "      --ports <ports>          Port list/spec for naabu (e.g. 100, 1000, 80,443,8080) (default: 100)"
+    echo "      --ports <ports>          Port list/spec for naabu (e.g. 100, 1000, full, or 80,443,8080) (default: 100)"
     echo "      --skip-ports             Skip port scanning stage"
     echo "      --skip-crawl             Skip web crawling stage"
     echo "      --skip-js                Skip JavaScript parsing & secret extraction"
@@ -88,12 +97,12 @@ while [[ "$#" -gt 0 ]]; do
         -t|--threads) THREADS="$2"; shift ;;
         -r|--rate-limit) RATE_LIMIT="$2"; shift ;;
         --delay) DELAY="$2"; shift ;;
-        --ports) PORT_LIST="$2"; shift ;;
+        --ports) PORT_LIST="$2"; PORTS_USER_SPECIFIED=1; shift ;;
         --skip-ports) SKIP_PORTS=1 ;;
         --skip-crawl) SKIP_CRAWL=1 ;;
         --skip-js) SKIP_JS=1 ;;
         -p|--passive) PASSIVE_ONLY=1 ;;
-        -f|--full) FULL_SCAN=1; PORT_LIST="1000" ;;
+        -f|--full) FULL_SCAN=1 ;;
         -h|--help) usage 0 ;;
         *) echo -e "${RED}[!] Unknown parameter: $1${NC}"; usage 1 ;;
     esac
@@ -105,8 +114,27 @@ if [[ -z "${DOMAIN:-}" ]]; then
     usage 1
 fi
 
-# Clean up domain input (strip protocol, trailing slash, www prefix if any)
-DOMAIN=$(echo "${DOMAIN}" | sed -e 's|^https\?://||' -e 's|/.*$||' | tr '[:upper:]' '[:lower:]')
+if [[ "${FULL_SCAN}" -eq 1 && "${PORTS_USER_SPECIFIED}" -eq 0 ]]; then
+    PORT_LIST="full"
+fi
+
+# Pre-flight Core Dependencies Check
+check_core_deps() {
+    local missing=()
+    for tool in curl jq python3; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing+=("$tool")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${RED}[!] Critical dependency missing: ${missing[*]}. Please install required packages.${NC}" >&2
+        exit 1
+    fi
+}
+check_core_deps
+
+# Clean up domain input (strip protocol, trailing slash, port, and www prefix if any)
+DOMAIN=$(echo "${DOMAIN}" | sed -e 's|^https\?://||' -e 's|/.*$||' -e 's|^www\.||' -e 's|:[0-9]\+$||' | tr '[:upper:]' '[:lower:]')
 
 # Directory Structure Setup
 TARGET_DIR="${OUTPUT_BASE}/${DOMAIN}"
@@ -154,7 +182,7 @@ SUB_OUTPUT="${TARGET_DIR}/subdomains/raw_subs.txt"
 log_info "Querying crt.sh Certificate Transparency logs..."
 curl -s --max-time 30 --retry 2 "https://crt.sh/?q=%25.${DOMAIN}&output=json" 2>/dev/null | \
     jq -r '.[].name_value // empty' 2>/dev/null | \
-    tr '\r' '\n' | sed -e 's/\*\.//g' -e 's/^[ \t]*//' | tr '[:upper:]' '[:lower:]' >> "${SUB_OUTPUT}" || true
+    tr '\r' '\n' | sed -e 's/^\*\.//' -e 's/^\*//' -e 's/^[ \t]*//' -e 's/[ \t]*$//' | tr '[:upper:]' '[:lower:]' >> "${SUB_OUTPUT}" || true
 
 # 1.2: Subfinder (with rate-limiting)
 if check_tool subfinder; then
@@ -195,12 +223,13 @@ IPS_FILE="${TARGET_DIR}/dns/unique_ips.txt"
 > "${IPS_FILE}"
 
 if check_tool dnsx; then
-    log_info "Resolving subdomains using dnsx (with wildcard detection, rate limit: ${RATE_LIMIT} rps)..."
+    log_info "Resolving subdomains using dnsx (with auto wildcard detection, rate limit: ${RATE_LIMIT} rps)..."
     dnsx -l "${CLEAN_SUBS}" \
          -silent \
          -t "${THREADS}" \
          -rate-limit "${RATE_LIMIT}" \
-         -wd "${DOMAIN}" \
+         -auto-wildcard \
+         -wt 5 \
          -a -cname -resp \
          -json -o "${RESOLVED_JSON}" || true
 
@@ -273,13 +302,13 @@ if [[ "${SKIP_PORTS}" -eq 0 ]] && check_tool naabu; then
     if [[ -s "${PORT_TARGETS}" ]]; then
         log_info "Scanning ports (${PORT_LIST}) with naabu (excluding CDN edge nodes, TCP connect mode, rate: ${RATE_LIMIT} pps)..."
         
-        NAABU_ARGS=("-l" "${PORT_TARGETS}" "-exclude-cdn" "-rate" "${RATE_LIMIT}" "-scan-type" "c" "-ec" "-silent" "-o" "${OPEN_PORTS}")
+        NAABU_ARGS=("-l" "${PORT_TARGETS}" "-exclude-cdn" "-rate" "${RATE_LIMIT}" "-scan-type" "c" "-silent" "-o" "${OPEN_PORTS}")
         
         if [[ "${PORT_LIST}" == "top-100" || "${PORT_LIST}" == "100" ]]; then
             NAABU_ARGS+=("-top-ports" "100")
         elif [[ "${PORT_LIST}" == "top-1000" || "${PORT_LIST}" == "1000" ]]; then
             NAABU_ARGS+=("-top-ports" "1000")
-        elif [[ "${PORT_LIST}" == "full" ]]; then
+        elif [[ "${PORT_LIST}" == "full" || "${PORT_LIST}" == "all" ]]; then
             NAABU_ARGS+=("-p" "-")
         else
             NAABU_ARGS+=("-p" "${PORT_LIST}")
@@ -303,15 +332,22 @@ ENDPOINTS_FILE="${TARGET_DIR}/endpoints/endpoints.txt"
 if [[ "${SKIP_CRAWL}" -eq 0 ]] && [[ -s "${WEB_URLS}" ]] && check_tool katana; then
     log_stage "5" "Web Crawling & Endpoint Discovery (Katana)"
     
-    log_info "Crawling web assets with katana (depth: 2, strictly in-scope, concurrency: ${THREADS}, rate limit: ${RATE_LIMIT})..."
+    CRAWL_DEPTH=3
+    CRAWL_DURATION="2m"
+    if [[ "${FULL_SCAN}" -eq 1 ]]; then
+        CRAWL_DEPTH=4
+        CRAWL_DURATION="5m"
+    fi
+
+    log_info "Crawling web assets with katana (depth: ${CRAWL_DEPTH}, duration: ${CRAWL_DURATION}, strictly in-scope, concurrency: ${THREADS}, rate limit: ${RATE_LIMIT})..."
     
     KATANA_ARGS=(
         "-list" "${WEB_URLS}"
-        "-depth" "2"
+        "-depth" "${CRAWL_DEPTH}"
         "-jc"
         "-kf" "all"
-        "-crawl-duration" "2m"
-        "-crawl-scope" "([a-zA-Z0-9_-]+\\.)*${DOMAIN}"
+        "-crawl-duration" "${CRAWL_DURATION}"
+        "-crawl-scope" "([a-zA-Z0-9_-]+\\.)*${ESCAPED_DOMAIN}"
         "-extension-filter" "png,jpg,jpeg,gif,svg,ico,css,woff,woff2,ttf,eot,mp4,avi,pdf,docx"
         "-silent"
         "-concurrency" "${THREADS}"
@@ -334,10 +370,12 @@ fi
 JS_URLS_FILE="${TARGET_DIR}/js/js_urls.txt"
 JS_ENDPOINTS_FILE="${TARGET_DIR}/js/js_endpoints.txt"
 JS_SECRETS_FILE="${TARGET_DIR}/js/js_secrets.txt"
+JS_SECRETS_REDACTED="${TARGET_DIR}/js/js_secrets_redacted.txt"
 
 > "${JS_URLS_FILE}"
 > "${JS_ENDPOINTS_FILE}"
 > "${JS_SECRETS_FILE}"
+> "${JS_SECRETS_REDACTED}"
 
 if [[ "${SKIP_JS}" -eq 0 ]]; then
     log_stage "6" "JavaScript Analysis, Route Filtering & Secret Mining"
@@ -361,16 +399,22 @@ if [[ "${SKIP_JS}" -eq 0 ]]; then
     if [[ "${JS_COUNT}" -gt 0 ]]; then
         log_info "Analyzing JavaScript files with entropy checks and false-positive suppression..."
         
-        python3 - "${JS_URLS_FILE}" "${JS_ENDPOINTS_FILE}" "${JS_SECRETS_FILE}" "${THREADS}" "${RATE_LIMIT}" << 'PYEOF'
+        python3 - "${JS_URLS_FILE}" "${JS_ENDPOINTS_FILE}" "${JS_SECRETS_FILE}" "${JS_SECRETS_REDACTED}" "${THREADS}" "${RATE_LIMIT}" "${DELAY}" << 'PYEOF'
 import sys
 import re
 import math
+import time
+import threading
 import urllib.request
 import ssl
 from concurrent.futures import ThreadPoolExecutor
 
-js_urls_file, ep_out_file, sec_out_file, threads_str, rate_str = sys.argv[1:6]
+js_urls_file, ep_out_file, sec_out_file, sec_redacted_file, threads_str, rate_str, delay_str = sys.argv[1:8]
 threads = max(1, min(int(threads_str), 30))
+try:
+    delay_sec = float(delay_str)
+except ValueError:
+    delay_sec = 0.0
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -393,7 +437,7 @@ def shannon_entropy(data: str) -> float:
     """Calculate Shannon entropy to ensure value is random enough to be a real secret."""
     if not data:
         return 0.0
-    entropy = 0
+    entropy = 0.0
     for x in set(data):
         p_x = float(data.count(x)) / len(data)
         entropy += - p_x * math.log2(p_x)
@@ -409,12 +453,22 @@ def is_valid_secret(val: str, min_entropy: float = 3.2) -> bool:
         return False
     return shannon_entropy(val) >= min_entropy
 
+def mask_secret(val: str) -> str:
+    """Redact secret string to first 4 characters for safe reporting."""
+    clean = val.strip().strip("'\"")
+    if len(clean) <= 6:
+        return "****REDACTED"
+    return clean[:4] + "****REDACTED"
+
 SECRET_PATTERNS = [
     ("AWS Access Key", re.compile(r'\bAKIA[0-9A-Z]{16}\b')),
+    ("Google API Key", re.compile(r'\bAIza[0-9A-Za-z\-_]{35}\b')),
     ("Slack Webhook", re.compile(r'https://hooks\.slack\.com/services/T[0-9A-Z]{8,12}/B[0-9A-Z]{8,12}/[0-9a-zA-Z]{24}')),
     ("Slack Bot Token", re.compile(r'\bxox[baprs]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*\b')),
     ("Stripe Secret Key", re.compile(r'\bsk_live_[0-9a-zA-Z]{24,}\b')),
     ("GitHub Personal Access Token", re.compile(r'\bgh[pousr]_[0-9a-zA-Z]{36}\b')),
+    ("GitLab Personal Access Token", re.compile(r'\bglpat-[0-9a-zA-Z_\-]{20}\b')),
+    ("JSON Web Token", re.compile(r'\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_\-\.\+\/=]{10,}\b')),
     ("Private RSA/DSA/EC Key", re.compile(r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----')),
     ("High-Entropy Secret Variable", re.compile(r'["\'](?:api_?secret|client_?secret|jwt_?secret|auth_?token)["\']\s*[:=]\s*["\']([a-zA-Z0-9_\-\.]{20,})["\']', re.I))
 ]
@@ -431,37 +485,53 @@ with open(js_urls_file, "r", encoding="utf-8", errors="ignore") as f:
 
 endpoints_found = set()
 secrets_found = set()
+secrets_redacted = set()
+lock = threading.Lock()
 
 def scan_url(url):
+    if delay_sec > 0:
+        time.sleep(delay_sec)
     try:
         req = urllib.request.Request(
             url, 
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         )
-        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            if "javascript" not in content_type and "text" not in content_type and "json" not in content_type:
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            content_type = resp.headers.get("Content-Type", "").lower()
+            is_js_ext = bool(re.search(r'\.js(\?|$)', url, re.I))
+            valid_ct = any(t in content_type for t in ("javascript", "ecmascript", "json", "text"))
+            if not is_js_ext and not valid_ct:
                 return
             content = resp.read(2 * 1024 * 1024).decode("utf-8", errors="ignore") # Max 2MB per file
             
+            local_eps = set()
+            local_secs = set()
+            local_redacted = set()
+
             # 1. Extract API Endpoints
             for match in EP_PATTERN.findall(content):
                 if not STATIC_EXTS.search(match.split("?")[0]):
-                    endpoints_found.add(f"{match} (from {url})")
+                    local_eps.add(f"{match} (from {url})")
             
             # 2. Extract Sensitive Credentials
             for name, pat in SECRET_PATTERNS:
                 for match in pat.findall(content):
                     candidate = match[0] if isinstance(match, tuple) else match
-                    if name == "High-Entropy Secret Variable":
-                        if not is_valid_secret(candidate, min_entropy=3.4):
+                    if name in ("High-Entropy Secret Variable", "JSON Web Token"):
+                        if not is_valid_secret(candidate, min_entropy=3.3):
                             continue
-                    secrets_found.add(f"[{name}] {candidate} (in {url})")
+                    local_secs.add(f"[{name}] {candidate} (in {url})")
+                    local_redacted.add(f"[{name}] {mask_secret(candidate)} (in {url})")
+
+            with lock:
+                endpoints_found.update(local_eps)
+                secrets_found.update(local_secs)
+                secrets_redacted.update(local_redacted)
     except Exception:
         pass
 
 with ThreadPoolExecutor(max_workers=threads) as executor:
-    executor.map(scan_url, urls[:300])
+    executor.map(scan_url, urls)
 
 with open(ep_out_file, "w", encoding="utf-8") as f:
     for ep in sorted(endpoints_found):
@@ -469,6 +539,10 @@ with open(ep_out_file, "w", encoding="utf-8") as f:
 
 with open(sec_out_file, "w", encoding="utf-8") as f:
     for sec in sorted(secrets_found):
+        f.write(sec + "\n")
+
+with open(sec_redacted_file, "w", encoding="utf-8") as f:
+    for sec in sorted(secrets_redacted):
         f.write(sec + "\n")
 PYEOF
         
@@ -516,12 +590,12 @@ REPORT_FILE="${TARGET_DIR}/reports/SUMMARY.md"
         echo "\`\`\`"
         echo ""
     fi
-    if [[ -s "${JS_SECRETS_FILE}" ]]; then
+    if [[ -s "${JS_SECRETS_REDACTED}" ]]; then
         echo "---"
         echo ""
-        echo "## 🔑 Validated Secrets in JS"
+        echo "## 🔑 Discovered Secrets in JS (Redacted)"
         echo "\`\`\`text"
-        head -n 25 "${JS_SECRETS_FILE}"
+        head -n 25 "${JS_SECRETS_REDACTED}"
         echo "\`\`\`"
         echo ""
     fi
@@ -536,6 +610,7 @@ REPORT_FILE="${TARGET_DIR}/reports/SUMMARY.md"
     echo "- **JavaScript URLs:** \`${TARGET_DIR}/js/js_urls.txt\`"
     echo "- **Extracted JS Endpoints:** \`${TARGET_DIR}/js/js_endpoints.txt\`"
     echo "- **Extracted JS Secrets:** \`${TARGET_DIR}/js/js_secrets.txt\`"
+    echo "- **Extracted JS Secrets (Redacted):** \`${TARGET_DIR}/js/js_secrets_redacted.txt\`"
 } > "${REPORT_FILE}"
 
 log_stage "COMPLETE" "Recon Workflow Finished"
