@@ -2,7 +2,7 @@
 
 > Multi-stage, high-performance reconnaissance and attack surface mapping pipeline.
 
-`ReconAutomator` automates passive and active external asset discovery, DNS resolution, HTTP probing, technology stack detection, port scanning, web endpoint crawling, and deep JavaScript secret/route extraction with built-in rate-limiting and structured reporting.
+`ReconAutomator` automates passive and active external asset discovery, DNS resolution, HTTP probing, technology stack detection, web endpoint crawling, and deep JavaScript secret/route extraction with built-in rate-limiting and structured reporting.
 
 ---
 
@@ -18,16 +18,14 @@
 - **Stage 3: HTTP Probing & Technology Fingerprinting**
   - Probes live services on common web ports (`httpx`)
   - Extracts HTTP status codes, page titles, server banners, CDN/WAF detection, and tech stacks
-- **Stage 4: Port & Service Scanning (`naabu`)**
-  - Fast port enumeration on discovered target hosts/IPs using `naabu` with TCP Connect (`-s c`) mode for non-root reliability and CDN avoidance (`-ec`)
-- **Stage 5: Web Crawling & Endpoint Discovery (`katana`)**
+- **Stage 4: Web Crawling & Endpoint Discovery (`katana`)**
   - Deep URL and JavaScript spidering using `katana` with headless and JavaScript parsing
-- **Stage 6: JavaScript Analysis, API Route Extraction & Secret Mining**
+- **Stage 5: JavaScript Analysis, API Route Extraction & Secret Mining**
   - Filters all `.js` asset files from crawls and live hosts
   - Extracts internal API routes (`/api/`, `/v1/`, `/graphql`, etc.)
   - Searches for hardcoded tokens (AWS keys, Google API keys, JWTs, Slack tokens, Stripe keys, Bearer headers)
-- **Stage 7: Structured Executive Reporting**
-  - Automatically compiles an executive `SUMMARY.md` report with markdown tables for all discovered live assets, open ports, and potential secrets
+- **Stage 6: Structured Executive Reporting**
+  - Automatically compiles an executive `SUMMARY.md` report with markdown tables for all discovered live assets and potential secrets
 
 ---
 
@@ -38,7 +36,6 @@ The following tools should be installed and available in your `$PATH`:
 - `subfinder`
 - `dnsx`
 - `httpx`
-- `naabu`
 - `katana`
 - `jq`, `curl`, `python3`
 
@@ -50,7 +47,6 @@ sudo apt update && sudo apt install -y jq curl python3
 go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
 go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
 go install -v github.com/projectdiscovery/katana/cmd/katana@latest
 ```
 
@@ -84,34 +80,27 @@ sudo ln -sf "$(pwd)/recon.sh" /usr/local/bin/recon-automator
 | `-t` | `--threads` | Concurrency / Worker threads | `25` |
 | `-r` | `--rate-limit` | Max requests per second across tools | `100` |
 | | `--delay` | Delay in seconds between crawler requests | `0` |
-| | `--ports` | Custom port list for naabu (`100`, `1000`, `80,443,8080`) | `top-100` |
-| | `--skip-ports` | Skip port scanning stage | `false` |
 | | `--skip-crawl` | Skip web crawling stage | `false` |
 | | `--skip-js` | Skip JavaScript analysis stage | `false` |
 | `-p` | `--passive` | Run passive enumeration only (no active probing) | `false` |
-| `-f` | `--full` | Full run (all ports + deep crawl) | `false` |
+| `-f` | `--full` | Full run (deep crawl) | `false` |
 | `-h` | `--help` | Display help message and exit | - |
 
 ---
 
 ## 💡 Examples
 
-### 1. Standard Recon (Subdomains + DNS + HTTP + Ports + Katana + JS Filter)
+### 1. Standard Recon (Subdomains + DNS + HTTP + Katana + JS Filter)
 ```bash
 ./recon.sh -d example.com -r 50 -t 20
 ```
 
-### 2. Custom Ports Scan
-```bash
-./recon.sh -d example.com --ports 80,443,8080,8443,8000,8888,3000,5000
-```
-
-### 3. Passive-Only Enumeration (Zero Packets Sent to Target)
+### 2. Passive-Only Enumeration (Zero Packets Sent to Target)
 ```bash
 ./recon.sh -d example.com --passive
 ```
 
-### 4. Full Deep Scan (All Ports + Delay)
+### 3. Full Deep Scan (Deep Crawl + Delay)
 ```bash
 ./recon.sh -d example.com --full -r 30 --delay 1 -o ./targets
 ```
@@ -135,8 +124,6 @@ recon_results/example.com/
 │   ├── alive_urls.txt              # Responsive HTTP/HTTPS URLs
 │   ├── httpx_summary.txt           # Formatted tabular overview
 │   └── httpx_detailed.json         # Raw JSON with headers & tech stack
-├── ports/
-│   └── open_ports.txt              # Open ports detected by naabu
 ├── endpoints/
 │   └── endpoints.txt               # Crawled routes & URL parameters
 ├── js/

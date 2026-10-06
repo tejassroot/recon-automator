@@ -6,9 +6,8 @@
 #   1. Subdomain Discovery (Passive: crt.sh, subfinder)
 #   2. DNS Resolution & Live Asset Filtering (dnsx with auto wildcard filtering)
 #   3. HTTP Probing, Tech Fingerprinting & Web Titles (httpx)
-#   4. Port Scanning & Service Identification (naabu with CDN exclusion)
-#   5. Web Crawling & Endpoint Discovery (katana with scope controls)
-#   6. JavaScript Asset Filtering, API Extraction & Secret Mining (Entropy-filtered)
+#   4. Web Crawling & Endpoint Discovery (katana with scope controls)
+#   5. JavaScript Asset Filtering, API Extraction & Secret Mining (Entropy-filtered)
 # ==============================================================================
 
 set -eo pipefail
@@ -36,12 +35,9 @@ THREADS=25
 RATE_LIMIT=100
 DELAY=0
 PASSIVE_ONLY=0
-SKIP_PORTS=0
 SKIP_CRAWL=0
 SKIP_JS=0
 FULL_SCAN=0
-PORT_LIST="top-100"
-PORTS_USER_SPECIFIED=0
 OUTPUT_BASE="./recon_results"
 
 banner() {
@@ -73,16 +69,13 @@ usage() {
     echo ""
     echo -e "${BOLD}Scan Scope Options:${NC}"
     echo "  -p, --passive                Passive enumeration only (crt.sh, subfinder)"
-    echo "  -f, --full                   Full aggressive scan (all ports + deep crawl)"
-    echo "      --ports <ports>          Port list/spec for naabu (e.g. 100, 1000, full, or 80,443,8080) (default: 100)"
-    echo "      --skip-ports             Skip port scanning stage"
+    echo "  -f, --full                   Full aggressive scan (deep crawl)"
     echo "      --skip-crawl             Skip web crawling stage"
     echo "      --skip-js                Skip JavaScript parsing & secret extraction"
     echo "  -h, --help                   Display this help message"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo "  $0 -d example.com -r 50 -t 20"
-    echo "  $0 -d example.com --ports 80,443,8080,8443,8000,8888,3000,5000"
     echo "  $0 -d example.com --passive"
     echo "  $0 -d example.com -o ./targets -r 30 --delay 1 --full"
     echo ""
@@ -97,8 +90,6 @@ while [[ "$#" -gt 0 ]]; do
         -t|--threads) THREADS="$2"; shift ;;
         -r|--rate-limit) RATE_LIMIT="$2"; shift ;;
         --delay) DELAY="$2"; shift ;;
-        --ports) PORT_LIST="$2"; PORTS_USER_SPECIFIED=1; shift ;;
-        --skip-ports) SKIP_PORTS=1 ;;
         --skip-crawl) SKIP_CRAWL=1 ;;
         --skip-js) SKIP_JS=1 ;;
         -p|--passive) PASSIVE_ONLY=1 ;;
@@ -112,10 +103,6 @@ done
 if [[ -z "${DOMAIN:-}" ]]; then
     echo -e "${RED}[!] Error: Target domain is required.${NC}"
     usage 1
-fi
-
-if [[ "${FULL_SCAN}" -eq 1 && "${PORTS_USER_SPECIFIED}" -eq 0 ]]; then
-    PORT_LIST="full"
 fi
 
 # Pre-flight Core Dependencies Check
@@ -141,7 +128,6 @@ TARGET_DIR="${OUTPUT_BASE}/${DOMAIN}"
 mkdir -p "${TARGET_DIR}/subdomains" \
          "${TARGET_DIR}/dns" \
          "${TARGET_DIR}/web" \
-         "${TARGET_DIR}/ports" \
          "${TARGET_DIR}/endpoints" \
          "${TARGET_DIR}/js" \
          "${TARGET_DIR}/reports"
@@ -285,52 +271,13 @@ WEB_COUNT=$(wc -l < "${WEB_URLS}" || echo "0")
 log_success "Found ${BOLD}${WEB_COUNT}${NC} responsive in-scope web endpoints."
 
 # ==============================================================================
-# STAGE 4: Port & Service Discovery (Naabu - CDN Excluded)
-# ==============================================================================
-OPEN_PORTS="${TARGET_DIR}/ports/open_ports.txt"
-> "${OPEN_PORTS}"
-
-if [[ "${SKIP_PORTS}" -eq 0 ]] && check_tool naabu; then
-    log_stage "4" "Port & Service Discovery (Naabu)"
-
-    # Determine targets: Use unique IPs if available, else resolved subdomains
-    PORT_TARGETS="${IPS_FILE}"
-    if [[ ! -s "${PORT_TARGETS}" ]]; then
-        PORT_TARGETS="${RESOLVED_SUBS}"
-    fi
-
-    if [[ -s "${PORT_TARGETS}" ]]; then
-        log_info "Scanning ports (${PORT_LIST}) with naabu (excluding CDN edge nodes, TCP connect mode, rate: ${RATE_LIMIT} pps)..."
-        
-        NAABU_ARGS=("-l" "${PORT_TARGETS}" "-exclude-cdn" "-rate" "${RATE_LIMIT}" "-scan-type" "c" "-silent" "-o" "${OPEN_PORTS}")
-        
-        if [[ "${PORT_LIST}" == "top-100" || "${PORT_LIST}" == "100" ]]; then
-            NAABU_ARGS+=("-top-ports" "100")
-        elif [[ "${PORT_LIST}" == "top-1000" || "${PORT_LIST}" == "1000" ]]; then
-            NAABU_ARGS+=("-top-ports" "1000")
-        elif [[ "${PORT_LIST}" == "full" || "${PORT_LIST}" == "all" ]]; then
-            NAABU_ARGS+=("-p" "-")
-        else
-            NAABU_ARGS+=("-p" "${PORT_LIST}")
-        fi
-
-        naabu "${NAABU_ARGS[@]}" || true
-        
-        PORT_COUNT=$(wc -l < "${OPEN_PORTS}" || echo "0")
-        log_success "Discovered ${BOLD}${PORT_COUNT}${NC} open ports/services on origin assets."
-    else
-        log_warn "No hosts available for port scanning."
-    fi
-fi
-
-# ==============================================================================
-# STAGE 5: Web Crawling & Endpoint Discovery (Katana - Scope Restricted)
+# STAGE 4: Web Crawling & Endpoint Discovery (Katana - Scope Restricted)
 # ==============================================================================
 ENDPOINTS_FILE="${TARGET_DIR}/endpoints/endpoints.txt"
 > "${ENDPOINTS_FILE}"
 
 if [[ "${SKIP_CRAWL}" -eq 0 ]] && [[ -s "${WEB_URLS}" ]] && check_tool katana; then
-    log_stage "5" "Web Crawling & Endpoint Discovery (Katana)"
+    log_stage "4" "Web Crawling & Endpoint Discovery (Katana)"
     
     CRAWL_DEPTH=3
     CRAWL_DURATION="2m"
@@ -365,7 +312,7 @@ if [[ "${SKIP_CRAWL}" -eq 0 ]] && [[ -s "${WEB_URLS}" ]] && check_tool katana; t
 fi
 
 # ==============================================================================
-# STAGE 6: JavaScript Extraction, API Endpoint Filter & Secret Mining
+# STAGE 5: JavaScript Extraction, API Endpoint Filter & Secret Mining
 # ==============================================================================
 JS_URLS_FILE="${TARGET_DIR}/js/js_urls.txt"
 JS_ENDPOINTS_FILE="${TARGET_DIR}/js/js_endpoints.txt"
@@ -378,7 +325,7 @@ JS_SECRETS_REDACTED="${TARGET_DIR}/js/js_secrets_redacted.txt"
 > "${JS_SECRETS_REDACTED}"
 
 if [[ "${SKIP_JS}" -eq 0 ]]; then
-    log_stage "6" "JavaScript Analysis, Route Filtering & Secret Mining"
+    log_stage "5" "JavaScript Analysis, Route Filtering & Secret Mining"
 
     log_info "Extracting and deduplicating JavaScript URLs..."
     
@@ -566,7 +513,6 @@ REPORT_FILE="${TARGET_DIR}/reports/SUMMARY.md"
     echo "- **Resolved Hosts:** ${ALIVE_COUNT}"
     echo "- **Unique IP Addresses:** ${IP_COUNT}"
     echo "- **Active Web Services:** ${WEB_COUNT}"
-    echo "- **Open Ports/Services:** $(wc -l < "${OPEN_PORTS}" || echo "0")"
     echo "- **Crawled Endpoints:** $(wc -l < "${ENDPOINTS_FILE}" || echo "0")"
     echo "- **In-Scope JavaScript Files:** $(wc -l < "${JS_URLS_FILE}" || echo "0")"
     echo "- **Extracted JS Routes:** $(wc -l < "${JS_ENDPOINTS_FILE}" || echo "0")"
@@ -581,15 +527,6 @@ REPORT_FILE="${TARGET_DIR}/reports/SUMMARY.md"
         jq -r '[.url, (.status_code|tostring), (.title // "-"), (.tech // [] | join(", "))] | "| " + .[0] + " | `" + .[1] + "` | " + (.[2]|gsub("\\|";"-")) + " | " + .[3] + " |"' "${HTTPX_JSON}" 2>/dev/null || true
     fi
     echo ""
-    if [[ -s "${OPEN_PORTS}" ]]; then
-        echo "---"
-        echo ""
-        echo "## 🔌 Discovered Open Ports (Origin Hosts)"
-        echo "\`\`\`text"
-        cat "${OPEN_PORTS}"
-        echo "\`\`\`"
-        echo ""
-    fi
     if [[ -s "${JS_SECRETS_REDACTED}" ]]; then
         echo "---"
         echo ""
@@ -605,7 +542,6 @@ REPORT_FILE="${TARGET_DIR}/reports/SUMMARY.md"
     echo "- **Subdomains:** \`${TARGET_DIR}/subdomains/unique_subdomains.txt\`"
     echo "- **DNS Records:** \`${TARGET_DIR}/dns/dns_records.json\`"
     echo "- **Live HTTP Services:** \`${TARGET_DIR}/web/alive_urls.txt\`"
-    echo "- **Open Ports:** \`${TARGET_DIR}/ports/open_ports.txt\`"
     echo "- **Endpoints:** \`${TARGET_DIR}/endpoints/endpoints.txt\`"
     echo "- **JavaScript URLs:** \`${TARGET_DIR}/js/js_urls.txt\`"
     echo "- **Extracted JS Endpoints:** \`${TARGET_DIR}/js/js_endpoints.txt\`"
